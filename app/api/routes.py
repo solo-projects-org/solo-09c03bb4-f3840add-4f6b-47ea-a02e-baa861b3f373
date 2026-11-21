@@ -172,6 +172,57 @@ def list_scans(batch_id: str, db=Depends(get_db)):
     return service.list_scans(db, batch_id)
 
 
+@router.post(
+    "/batches/{batch_id}/scans/restore",
+    response_model=models.ScanRestoreOut,
+    tags=["数据修复"],
+    summary="从历史核对结果补回缺失的扫描记录",
+    description=(
+        "扫描表从旧备份恢复缺行时，按批次从历史核对结果的扫描明细补回缺失记录，"
+        "保留原扫描号、入库序号与原始字段；同一扫描在各版装箱单下展开不同也只补一笔。"
+        "历史明细与现存记录冲突（同批扫描号或全库入库序号指向不同原始记录）时返回 409 "
+        "并指出冲突及记录来源，停止修复。比对期间扫描照常受理；提交时按当时生效的装箱单，"
+        "用补回记录和该批全部现存扫描重建现行核对结果，补回记录与新结果同一事务生效，"
+        "历史结果仍按原号查询。装箱单更正重算期间返回 409，请稍后重试；"
+        "写入失败整体回滚，已补齐时返回 `no_missing`。"
+    ),
+)
+def restore_scans(batch_id: str, db=Depends(get_db)):
+    outcome = service.restore_scans(db, batch_id)
+    result = (
+        service.get_result(db, batch_id, outcome["result_id"])
+        if outcome["result_id"] is not None
+        else None
+    )
+    restored = [
+        {
+            "seq": record["seq"],
+            "scan_id": record["scan_id"],
+            "receiving_point": record["receiving_point"],
+            "kind": "carton" if record["carton_no"] is not None else "serial",
+            "carton_no": record["carton_no"],
+            "serial_no": record["serial_no"],
+            "seal_intact": record["seal_intact"],
+            "accepted_at": record["accepted_at"],
+            "source_result_ids": record["source_result_ids"],
+        }
+        for record in outcome["restored"]
+    ]
+    message = (
+        f"已补回 {len(restored)} 条扫描记录，并按当前生效装箱单重建现行核对结果"
+        if outcome["status"] == "restored"
+        else "历史扫描明细均已存在于扫描表中，无需补回"
+    )
+    return {
+        "batch_id": batch_id,
+        "status": outcome["status"],
+        "message": message,
+        "restored_count": len(restored),
+        "restored": restored,
+        "result": result,
+    }
+
+
 @router.get(
     "/batches/{batch_id}/result",
     response_model=models.VerificationResultOut,

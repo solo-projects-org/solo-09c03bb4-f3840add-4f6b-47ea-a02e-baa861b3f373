@@ -591,6 +591,282 @@ def refresh_active_result(db: Database, batch_id: str) -> int:
         return refresh_result_locked(conn, batch_id, active)
 
 
+# ---------------------------------------------------------------------------
+# Scan-table repair from historical verification results
+# ---------------------------------------------------------------------------
+#
+# When the scans table is recovered from an old backup, some accepted rows are
+# missing while every historical result still carries their scan details.
+# ``restore_scans`` backfills the missing rows from those details, preserving
+# the original scan id, storage sequence number (``scans.id``) and payload.
+#
+# The comparison runs on a read snapshot so scan intake keeps committing; the
+# commit phase re-verifies under the write lock, inserts the missing rows and
+# rebuilds the active result with the packing list effective at that moment —
+# all in one transaction.
+
+
+def _history_record(row: sqlite3.Row) -> dict[str, Any]:
+    """Original scan fields carried by one historical result detail row."""
+    return {
+        "seq": int(row["seq"]),
+        "scan_id": row["scan_id"],
+        "receiving_point": row["receiving_point"],
+        "carton_no": row["carton_no"],
+        "serial_no": row["serial_no"],
+        "seal_intact": (
+            None if row["seal_intact"] is None else bool(row["seal_intact"])
+        ),
+        "accepted_at": row["accepted_at"],
+    }
+
+
+def _existing_record(row: sqlite3.Row) -> dict[str, Any]:
+    """Original scan fields of a surviving ``scans`` row (id == seq)."""
+    return {
+        "seq": int(row["id"]),
+        "scan_id": row["scan_id"],
+        "receiving_point": row["receiving_point"],
+        "carton_no": row["carton_no"],
+        "serial_no": row["serial_no"],
+        "seal_intact": (
+            None if row["seal_intact"] is None else bool(row["seal_intact"])
+        ),
+        "accepted_at": row["accepted_at"],
+    }
+
+
+def _same_original(record: dict[str, Any], row: sqlite3.Row) -> bool:
+    return (
+        record["seq"] == int(row["id"])
+        and record["scan_id"] == row["scan_id"]
+        and record["receiving_point"] == row["receiving_point"]
+        and record["carton_no"] == row["carton_no"]
+        and record["serial_no"] == row["serial_no"]
+        and record["seal_intact"]
+        == (None if row["seal_intact"] is None else bool(row["seal_intact"]))
+        and record["accepted_at"] == row["accepted_at"]
+    )
+
+
+def plan_scan_restore(
+    history_rows: Sequence[sqlite3.Row], existing_rows: Sequence[sqlite3.Row]
+) -> dict[str, Any]:
+    """Compare historical scan details with surviving rows.
+
+    Returns ``{"conflicts": [...], "missing": [...]}``.  ``missing`` rows are
+    ready to insert (original seq/scan_id/fields plus ``source_result_ids``).
+    Any conflict aborts the repair: the same batch scan id or the same global
+    storage sequence number must never point at two different records.
+    """
+    conflicts: list[dict[str, Any]] = []
+
+    # The same scan appears once per result that included it, expanded
+    # differently under each packing-list version.  Only the original record
+    # fields are compared; expansion/unmatched columns are version-specific
+    # and intentionally ignored.
+    by_scan_id: dict[str, list[sqlite3.Row]] = {}
+    for row in history_rows:
+        by_scan_id.setdefault(row["scan_id"], []).append(row)
+
+    canonical: dict[str, dict[str, Any]] = {}
+    for scan_id, rows in by_scan_id.items():
+        entries = [(int(row["result_id"]), _history_record(row)) for row in rows]
+        first_result_id, first = entries[0]
+        mismatched = [
+            {"source": "历史核对结果", "result_id": result_id, "record": record}
+            for result_id, record in entries[1:]
+            if record != first
+        ]
+        if mismatched:
+            conflicts.append(
+                {
+                    "type": "history",
+                    "scan_id": scan_id,
+                    "records": [
+                        {
+                            "source": "历史核对结果",
+                            "result_id": first_result_id,
+                            "record": first,
+                        },
+                        *mismatched,
+                    ],
+                }
+            )
+            continue
+        canonical[scan_id] = {
+            **first,
+            "source_result_ids": sorted({result_id for result_id, _ in entries}),
+        }
+
+    if conflicts:
+        return {"conflicts": conflicts, "missing": []}
+
+    existing_by_scan_id = {row["scan_id"]: row for row in existing_rows}
+    existing_by_seq = {int(row["id"]): row for row in existing_rows}
+
+    missing: list[dict[str, Any]] = []
+    for scan_id, record in sorted(canonical.items(), key=lambda kv: kv[1]["seq"]):
+        public_record = {
+            key: record[key] for key in record if key != "source_result_ids"
+        }
+        existing = existing_by_scan_id.get(scan_id)
+        if existing is not None:
+            if not _same_original(record, existing):
+                conflicts.append(
+                    {
+                        "type": "scan_id",
+                        "scan_id": scan_id,
+                        "history": {
+                            "source": "历史核对结果",
+                            "result_ids": record["source_result_ids"],
+                            "record": public_record,
+                        },
+                        "existing": {
+                            "source": "现存扫描表",
+                            "record": _existing_record(existing),
+                        },
+                    }
+                )
+            continue
+        occupant = existing_by_seq.get(record["seq"])
+        if occupant is not None:
+            conflicts.append(
+                {
+                    "type": "seq",
+                    "seq": record["seq"],
+                    "history": {
+                        "source": "历史核对结果",
+                        "scan_id": scan_id,
+                        "result_ids": record["source_result_ids"],
+                        "record": public_record,
+                    },
+                    "existing": {
+                        "source": "现存扫描表",
+                        "scan_id": occupant["scan_id"],
+                        "record": _existing_record(occupant),
+                    },
+                }
+            )
+            continue
+        missing.append(record)
+
+    if not conflicts:
+        # Two different missing scan ids claiming one storage sequence number
+        # means the historical details contradict each other.
+        seq_owner: dict[int, str] = {}
+        for record in missing:
+            other = seq_owner.get(record["seq"])
+            if other is not None:
+                conflicts.append(
+                    {
+                        "type": "history",
+                        "seq": record["seq"],
+                        "scan_ids": [other, record["scan_id"]],
+                        "message": (
+                            f"入库序号 {record['seq']} 在历史明细中同时对应"
+                            f"扫描号 {other} 与 {record['scan_id']}"
+                        ),
+                    }
+                )
+            else:
+                seq_owner[record["seq"]] = record["scan_id"]
+
+    return {"conflicts": conflicts, "missing": [] if conflicts else missing}
+
+
+def _load_restore_plan(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
+    history_rows = conn.execute(
+        """
+        SELECT d.result_id, d.seq, d.scan_id, d.receiving_point,
+               d.carton_no, d.serial_no, d.seal_intact, d.accepted_at
+          FROM result_scan_details d
+          JOIN verification_results r ON r.id = d.result_id
+         WHERE r.batch_id = ?
+         ORDER BY d.seq, d.result_id
+        """,
+        (batch_id,),
+    ).fetchall()
+    existing_rows = conn.execute(
+        "SELECT * FROM scans WHERE batch_id = ? ORDER BY id", (batch_id,)
+    ).fetchall()
+    return plan_scan_restore(history_rows, existing_rows)
+
+
+def _conflict_payload(conflicts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "message": "历史扫描明细与现存扫描记录存在冲突，已停止修复",
+        "conflicts": conflicts,
+    }
+
+
+def restore_scans(db: Database, batch_id: str) -> dict[str, Any]:
+    """Backfill scan rows lost to an old backup restore.
+
+    Phase 1 (read snapshot): collect historical scan details and compare them
+    with surviving rows.  Scan intake keeps committing during this phase.
+    Phase 2 (writer transaction): re-verify under the write lock (a scan
+    accepted meanwhile may have reused a missing sequence number), insert the
+    missing rows preserving their original storage sequence numbers, and
+    rebuild the active result with the packing list effective at commit time.
+    Any write failure rolls the whole repair back; once every historical scan
+    is present the repair reports ``no_missing``.
+    """
+    with db.read() as conn:
+        _batch_row(conn, batch_id)
+        if _pending_version_row(conn, batch_id) is not None:
+            raise ConflictError("装箱单更正正在重算，请稍后重试")
+        preview = _load_restore_plan(conn, batch_id)
+        if preview["conflicts"]:
+            raise ConflictError(_conflict_payload(preview["conflicts"]))
+        if not preview["missing"]:
+            return {"status": "no_missing", "restored": [], "result_id": None}
+
+    try:
+        with db.immediate() as conn:
+            _batch_row(conn, batch_id)
+            if _pending_version_row(conn, batch_id) is not None:
+                raise ConflictError("装箱单更正正在重算，请稍后重试")
+            plan = _load_restore_plan(conn, batch_id)
+            if plan["conflicts"]:
+                raise ConflictError(_conflict_payload(plan["conflicts"]))
+            if not plan["missing"]:
+                return {"status": "no_missing", "restored": [], "result_id": None}
+            for record in plan["missing"]:
+                conn.execute(
+                    """
+                    INSERT INTO scans (
+                        id, batch_id, scan_id, receiving_point,
+                        carton_no, serial_no, seal_intact, accepted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["seq"],
+                        batch_id,
+                        record["scan_id"],
+                        record["receiving_point"],
+                        record["carton_no"],
+                        record["serial_no"],
+                        (
+                            None
+                            if record["seal_intact"] is None
+                            else int(record["seal_intact"])
+                        ),
+                        record["accepted_at"],
+                    ),
+                )
+            active = _active_version_row(conn, batch_id)
+            if active is None:  # defensive: registration always creates one
+                raise ConflictError(f"批次 {batch_id} 没有生效的装箱单")
+            result_id = refresh_result_locked(conn, batch_id, active)
+    except ServiceError:
+        raise
+    except Exception as exc:
+        raise InternalError("修复写入失败，本次修复已回滚，请重试") from exc
+
+    return {"status": "restored", "restored": plan["missing"], "result_id": result_id}
+
+
 def correct_packing_list(
     db: Database,
     batch_id: str,

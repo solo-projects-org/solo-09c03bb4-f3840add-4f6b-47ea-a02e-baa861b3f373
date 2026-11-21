@@ -292,6 +292,33 @@ class CorrectionOut(BaseModel):
     result: VerificationResultOut
 
 
+class RestoredScanOut(BaseModel):
+    seq: int = Field(description="入库序号，与历史明细中的扫描记录序号一致")
+    scan_id: str
+    receiving_point: str
+    kind: Literal["carton", "serial"]
+    carton_no: str | None
+    serial_no: str | None
+    seal_intact: bool | None
+    accepted_at: str
+    source_result_ids: list[int] = Field(
+        description="该扫描的明细出现在哪些历史核对结果中（记录来源）"
+    )
+
+
+class ScanRestoreOut(BaseModel):
+    batch_id: str
+    status: Literal["restored", "no_missing"] = Field(
+        description="restored=已补回并重建现行结果；no_missing=扫描表已完整，无需补回"
+    )
+    message: str
+    restored_count: int
+    restored: list[RestoredScanOut]
+    result: VerificationResultOut | None = Field(
+        description="status=restored 时为按当前生效装箱单重建的现行核对结果；no_missing 时为 null"
+    )
+
+
 class ScanAcceptedOut(BaseModel):
     batch_id: str
     result_refreshed: bool = Field(

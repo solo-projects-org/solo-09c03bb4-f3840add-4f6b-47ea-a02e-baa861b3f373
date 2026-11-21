@@ -20,6 +20,12 @@ Docker Compose 启动。
 | 新版一次性纳入已受理扫描：实收、冲突、无凭证、明细同一事务生效 | `correct_packing_list` 的激活事务 |
 | 变更失败继续按原装箱单供数 | 失败分支：原版本/原结果不被修改，并记录 `failed` 版本 |
 | 未知箱号 / 不在装箱单中的序列号 | 计为 `unmatched` 扫描，不产生假实收 |
+| 扫描表缺行时从历史核对结果的扫描明细补回 | `POST .../scans/restore`、`app/service.py` `restore_scans` |
+| 补回保留原扫描号、入库序号与原始字段；同一扫描各版本展开不同只补一笔 | `plan_scan_restore` 按扫描号归并，忽略随版本变化的展开列 |
+| 同批扫描号或全库入库序号指向不同原始记录 → 409 指出冲突及来源，停止修复 | `plan_scan_restore` 的三类冲突（history/scan_id/seq） |
+| 比对期间照常受理扫描；提交时按当时生效的装箱单重建现行结果 | 比对在读快照上进行，提交在写事务内复核后重建 |
+| 补回记录与新结果同一事务生效；历史结果仍按原号查询 | `restore_scans` 的提交事务；历史结果不被修改 |
+| 装箱单更正重算期间修复返回 409；写入失败整体回滚；已补齐返回 `no_missing` | `restore_scans` 的 pending 检查与事务回滚 |
 
 补充约定：
 
@@ -29,6 +35,12 @@ Docker Compose 启动。
 - 服务重启时，中断的 `pending` 版本会标记为 `failed`，并把期间已受理的扫描补算进原
   生效版本，避免旧结果失真。
 - `RECALC_DELAY_SECONDS` 只用于演示重算窗口，生产可设为 0。
+- 扫描表从旧备份恢复缺行时，历史核对结果的扫描明细仍在。修复接口按批次从
+  这些明细补回缺行：先在读快照上比对（扫描照常受理），再在写事务内复核、按原
+  入库序号插入缺行，并用当时生效的装箱单重建现行核对结果。同一扫描在各版装箱
+  单下展开不同只补一笔；历史明细与现存记录冲突（同批扫描号或全库入库序号指向
+  不同原始记录）时返回 409 并指出冲突及记录来源，停止修复。写入失败整体回滚，
+  重试时若已补齐返回 `no_missing`。
 
 ## 启动（Docker Compose）
 
@@ -86,6 +98,27 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
    - 新版本生效后，窗口内受理的扫描已包含在版本 2 的结果中。
 7. 历史结果与装箱单版本可分别查询。
 
+### 扫描表缺行修复演示
+
+`scripts/demo_restore.py` 直接连 SQLite 删除若干扫描行（历史核对结果的扫描
+明细仍保留），制造“旧备份恢复缺行”样例，并串联修复接口的全部分支：
+
+```bash
+# 本地运行（服务以默认 DB_PATH 启动）
+python3 scripts/demo_restore.py
+# 或在容器内运行（脚本已随镜像分发）
+docker compose exec api python /srv/scripts/demo_restore.py
+```
+
+1. 缺行修复：补回 2 行，保留原扫描号/入库序号/原始字段，现行结果按生效装箱单
+   重建；重试返回 `no_missing`。
+2. 恢复后继续受理的新扫描复用了被删入库序号 → 修复返回 409，指出冲突双方及
+   记录来源（历史核对结果 vs 现存扫描表），扫描表未被改动。
+3. 恢复数据中同批扫描号的字段与历史明细不符 → 409。
+4. 装箱单更正重算期间修复 → 409 稍后重试；更正生效后修复按新版本重建结果。
+5. 结尾留下一个未修复的漏行批次（`RESTORE-*-SWAGGER`），可在 Swagger 的
+   `POST /batches/{id}/scans/restore` 里亲手执行。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -97,6 +130,7 @@ API_BASE=http://localhost:8000 DEMO_BATCH=DEMO-1 python3 scripts/demo.py
 | POST | `/batches/{id}/packing-lists/corrections` | 更正单件所属箱并重算 |
 | POST | `/batches/{id}/scans` | 接收整箱/单件扫描 |
 | GET | `/batches/{id}/scans` | 已受理扫描列表 |
+| POST | `/batches/{id}/scans/restore` | 从历史核对结果补回缺失扫描并重建现行结果 |
 | GET | `/batches/{id}/result` | 生效核对结果 |
 | GET | `/batches/{id}/results` | 历史结果列表 |
 | GET | `/batches/{id}/results/{result_id}` | 指定历史结果 |
@@ -122,6 +156,7 @@ app/
   models.py      Pydantic 请求/响应模型
   service.py     核对规则、版本切换、查询
   api/routes.py  HTTP 路由
-scripts/demo.py  Swagger 演示脚本（标准库）
+scripts/demo.py         Swagger 演示脚本（标准库）
+scripts/demo_restore.py 扫描表缺行样例与修复演示（标准库）
 tests/           pytest + FastAPI TestClient
 ```
