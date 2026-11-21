@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    image: receiving-verification-api:local
+    container_name: receiving-verification-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Artificial delay so the Swagger demo can show queries still serving the
+      # previous packing list while the new version recalculates.
+      RECALC_DELAY_SECONDS: "${RECALC_DELAY_SECONDS:-3}"
+      DB_PATH: /data/verification.db
+    volumes:
+      - verification-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  verification-data:
